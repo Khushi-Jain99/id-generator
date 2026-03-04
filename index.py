@@ -2,7 +2,7 @@ from PyQt5.QtCore import * # type: ignore
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
 import sys
-import MySQLdb
+import MySQLdb # type: ignore
 from PyQt5.uic import loadUiType
 
 

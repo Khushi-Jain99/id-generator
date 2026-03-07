@@ -1,9 +1,12 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QFont, QIcon
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QFormLayout,
-                             QLineEdit, QPushButton, QLabel, QSpacerItem,
-                             QSizePolicy, QMessageBox)
+from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PyQt5.QtGui import QFont, QPixmap, QImage
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QLineEdit, QPushButton, QLabel, QSpacerItem, QSizePolicy,
+    QMessageBox, QDialog, QFileDialog, QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
+)
 from PIL import Image, ImageDraw, ImageFont
 import random
 import os
@@ -11,376 +14,673 @@ import datetime
 import qrcode
 import cv2
 import sys
-import numpy as np
+
+# ─── Card dimension constants (standard ID at 300 DPI) ────
+CARD_W, CARD_H = 1012, 638
+HEADER_H = 120
+ACCENT_H = 4
+FOOTER_H = 84
+CORNER_R = 24
+PHOTO_W, PHOTO_H = 200, 250
+PHOTO_BORDER = 3
+
+# ─── Colour palette ───────────────────────────────────────
+C_PRIMARY = (13, 71, 161)
+C_ACCENT = (255, 193, 7)
+C_WHITE = (255, 255, 255)
+C_DARK = (33, 33, 33)
+C_GRAY = (117, 117, 117)
+C_LIGHT_GRAY = (245, 245, 245)
+C_RED = (183, 28, 28)
+C_HEADER_SUB = (187, 222, 251)
 
 
+# ─── Font helper with caching ─────────────────────────────
+_font_cache = {}
+
+
+def get_font(size, bold=False):
+    key = (size, bold)
+    if key in _font_cache:
+        return _font_cache[key]
+    candidates = []
+    if bold:
+        candidates += [
+            "C:\\Windows\\Fonts\\arialbd.ttf",
+            "C:\\Windows\\Fonts\\segoeuib.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ]
+    candidates += [
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Arial.ttf",
+        "arial.ttf",
+    ]
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                f = ImageFont.truetype(p, size=size)
+                _font_cache[key] = f
+                return f
+        except Exception:
+            continue
+    f = ImageFont.load_default()
+    _font_cache[key] = f
+    return f
+
+
+# ─── Helper: round corners on a PIL image ─────────────────
+def round_corners(img, radius):
+    img = img.convert("RGBA")
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [(0, 0), (img.width - 1, img.height - 1)], radius, fill=255
+    )
+    img.putalpha(mask)
+    return img
+
+
+# ─── Helper: RGBA → RGB on white background ───────────────
+def rgba_to_rgb(img):
+    bg = Image.new("RGB", img.size, (255, 255, 255))
+    if img.mode == "RGBA":
+        bg.paste(img, mask=img.split()[3])
+    else:
+        bg.paste(img)
+    return bg
+
+
+# ─── Helper: monogram circle ──────────────────────────────
+def monogram_circle(letter, diameter, bg_col, fg_col, font):
+    img = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([(0, 0), (diameter - 1, diameter - 1)], fill=bg_col)
+    bbox = d.textbbox((0, 0), letter, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text(
+        ((diameter - tw) / 2, (diameter - th) / 2 - 2),
+        letter, fill=fg_col, font=font,
+    )
+    return img
+
+
+# ═══════════════════════════════════════════════════════════
+#  Preview Dialog
+# ═══════════════════════════════════════════════════════════
+class IDCardPreview(QDialog):
+    """Shows the generated front & back cards with download buttons."""
+
+    def __init__(self, front_pil, back_pil, default_name, parent=None):
+        super().__init__(parent)
+        self.front_pil = front_pil
+        self.back_pil = back_pil
+        self.default_name = default_name
+        self.setWindowTitle("ID Card Preview")
+        self.setMinimumSize(1100, 720)
+        self._build_ui()
+
+    # ── UI ──────────────────────────────────────────────────
+    def _build_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 #e8eaf6, stop:1 #e3f2fd);
+            }
+            QLabel#cardLabel { background: transparent; border: none; }
+            QPushButton#dlBtn {
+                background-color: #0D47A1; color: white;
+                border: none; border-radius: 8px;
+                font-weight: bold; font-size: 13px;
+                padding: 12px 28px;
+            }
+            QPushButton#dlBtn:hover { background-color: #1565C0; }
+            QPushButton#closeBtn {
+                background-color: #757575; color: white;
+                border: none; border-radius: 8px;
+                font-weight: bold; font-size: 13px;
+                padding: 12px 28px;
+            }
+            QPushButton#closeBtn:hover { background-color: #616161; }
+            QLabel#heading { color: #0D47A1; font-size: 22px; font-weight: bold; }
+            QLabel#sideLabel { color: #424242; font-size: 14px; font-weight: bold; }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(30, 20, 30, 20)
+        root.setSpacing(16)
+
+        heading = QLabel("Generated ID Card")
+        heading.setObjectName("heading")
+        heading.setAlignment(Qt.AlignCenter)
+        root.addWidget(heading)
+
+        # ── Cards side by side ──
+        cards = QHBoxLayout()
+        cards.setSpacing(40)
+        cards.setAlignment(Qt.AlignCenter)
+
+        for label_text, pil_img in [("Front", self.front_pil),
+                                     ("Back", self.back_pil)]:
+            col = QVBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setObjectName("sideLabel")
+            lbl.setAlignment(Qt.AlignCenter)
+            col.addWidget(lbl)
+
+            card_lbl = QLabel()
+            card_lbl.setObjectName("cardLabel")
+            card_lbl.setAlignment(Qt.AlignCenter)
+            pixmap = self._pil_to_pixmap(pil_img).scaled(
+                480, 302, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            card_lbl.setPixmap(pixmap)
+
+            shadow = QGraphicsDropShadowEffect()
+            shadow.setBlurRadius(25)
+            shadow.setOffset(0, 4)
+            shadow.setColor(QtGui.QColor(0, 0, 0, 80))
+            card_lbl.setGraphicsEffect(shadow)
+            col.addWidget(card_lbl)
+            cards.addLayout(col)
+
+        root.addLayout(cards)
+        root.addSpacing(10)
+
+        # ── Buttons ──
+        btn_row = QHBoxLayout()
+        btn_row.setAlignment(Qt.AlignCenter)
+        btn_row.setSpacing(16)
+
+        for text, slot, obj_name in [
+            ("Download as PNG", self._save_png, "dlBtn"),
+            ("Download as PDF", self._save_pdf, "dlBtn"),
+            ("Close", self.accept, "closeBtn"),
+        ]:
+            btn = QPushButton(text)
+            btn.setObjectName(obj_name)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(slot)
+            btn_row.addWidget(btn)
+
+        root.addLayout(btn_row)
+
+        # ── Fade-in animation ──
+        opacity = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(opacity)
+        anim = QPropertyAnimation(opacity, b"opacity", self)
+        anim.setDuration(400)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start()
+        self._anim = anim  # prevent GC
+
+    # ── Conversions ─────────────────────────────────────────
+    @staticmethod
+    def _pil_to_pixmap(pil_img):
+        img = pil_img.convert("RGBA")
+        data = img.tobytes("raw", "RGBA")
+        qimg = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
+        return QPixmap.fromImage(qimg)
+
+    def _combined_image(self):
+        gap = 30
+        w = max(self.front_pil.width, self.back_pil.width)
+        h = self.front_pil.height + gap + self.back_pil.height
+        combined = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+        combined.paste(self.front_pil, (0, 0), self.front_pil)
+        combined.paste(self.back_pil, (0, self.front_pil.height + gap),
+                       self.back_pil)
+        return combined
+
+    # ── Save handlers ───────────────────────────────────────
+    def _save_png(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save ID Card as PNG",
+            os.path.join(os.path.expanduser("~"), "Desktop",
+                         f"{self.default_name}_IDCard.png"),
+            "PNG Image (*.png)",
+        )
+        if path:
+            rgba_to_rgb(self._combined_image()).save(path, "PNG")
+            QMessageBox.information(self, "Saved", f"ID card saved to:\n{path}")
+
+    def _save_pdf(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save ID Card as PDF",
+            os.path.join(os.path.expanduser("~"), "Desktop",
+                         f"{self.default_name}_IDCard.pdf"),
+            "PDF File (*.pdf)",
+        )
+        if path:
+            front_rgb = rgba_to_rgb(self.front_pil)
+            back_rgb = rgba_to_rgb(self.back_pil)
+            front_rgb.save(path, "PDF", save_all=True,
+                           append_images=[back_rgb])
+            QMessageBox.information(self, "Saved", f"ID card saved to:\n{path}")
+
+
+# ═══════════════════════════════════════════════════════════
+#  Main Window
+# ═══════════════════════════════════════════════════════════
 class IDCardGenerator(QMainWindow):
-    """Modern Professional ID Card Generator Application"""
+    """Professional ID Card Generator Application"""
 
     def __init__(self):
         super().__init__()
-        self.init_ui()
+        self._build_ui()
 
-    def init_ui(self):
-        """Initialize and setup the user interface with modern design"""
-        # Main window properties
+    # ── Window setup ────────────────────────────────────────
+    def _build_ui(self):
         self.setWindowTitle("Professional ID Card Generator")
-        self.setGeometry(100, 100, 900, 650)
-        self.center_window()
-        self.setMinimumSize(900, 650)
+        self.setGeometry(100, 100, 920, 760)
+        self._center()
+        self.setMinimumSize(920, 760)
+        self.setStyleSheet(_MAIN_STYLE)
 
-        # Apply global stylesheet
-        self.setStyleSheet(self.get_global_stylesheet())
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(24, 24, 24, 24)
+        root.setSpacing(0)
 
-        # Create central widget and main layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(0)
-
-        # Create title
-        title = self.create_title()
-        main_layout.addWidget(title)
-        main_layout.addSpacing(15)
-
-        # Create card container with modern styling
-        card_widget = QWidget()
-        card_widget.setObjectName("cardContainer")
-        card_layout = QVBoxLayout(card_widget)
-        card_layout.setContentsMargins(40, 40, 40, 40)
-        card_layout.setSpacing(20)
-
-        # Add form layout
-        form_layout = self.create_form_layout()
-        card_layout.addLayout(form_layout)
-
-        # Add button layout
-        button_layout = self.create_button_layout()
-        card_layout.addLayout(button_layout)
-
-        # Add spacer
-        spacer = QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding)
-        card_layout.addItem(spacer)
-
-        main_layout.addWidget(card_widget)
-
-    def create_title(self):
-        """Create title label"""
+        # Title
         title = QLabel("ID Card Generator")
-        title_font = QFont("Segoe UI", 28)
-        title_font.setBold(True)
-        title.setFont(title_font)
+        title.setObjectName("appTitle")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("color: #1a73e8; font-weight: bold;")
-        return title
+        root.addWidget(title)
+        root.addSpacing(18)
 
-    def create_form_layout(self):
-        """Create form layout for input fields"""
-        form_layout = QFormLayout()
-        form_layout.setSpacing(18)
-        form_layout.setHorizontalSpacing(30)
+        # Card container
+        card = QWidget()
+        card.setObjectName("cardContainer")
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(30)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 45))
+        card.setGraphicsEffect(shadow)
 
-        # Set label properties
-        label_font = QFont("Segoe UI", 11)
-        label_font.setBold(True)
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(44, 36, 44, 36)
+        card_lay.setSpacing(22)
+        card_lay.addLayout(self._create_form())
+        card_lay.addLayout(self._create_buttons())
+        card_lay.addItem(
+            QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        )
 
-        # Company Name
-        company_label = QLabel("Company Name:")
-        company_label.setFont(label_font)
-        company_label.setStyleSheet("color: #202124; padding-right: 10px;")
-        self.lineEdit = self.create_input_field()
-        form_layout.addRow(company_label, self.lineEdit)
+        root.addWidget(card)
 
-        # Full Name
-        fullname_label = QLabel("Full Name:")
-        fullname_label.setFont(label_font)
-        fullname_label.setStyleSheet("color: #202124; padding-right: 10px;")
-        self.lineEdit_2 = self.create_input_field()
-        form_layout.addRow(fullname_label, self.lineEdit_2)
+    # ── Form fields ─────────────────────────────────────────
+    def _create_form(self):
+        form = QFormLayout()
+        form.setSpacing(16)
+        form.setHorizontalSpacing(28)
 
-        # Gender
-        gender_label = QLabel("Gender:")
-        gender_label.setFont(label_font)
-        gender_label.setStyleSheet("color: #202124; padding-right: 10px;")
-        self.lineEdit_3 = self.create_input_field()
-        form_layout.addRow(gender_label, self.lineEdit_3)
+        lbl_font = QFont("Segoe UI", 11)
+        lbl_font.setBold(True)
 
-        # Address
-        address_label = QLabel("Address:")
-        address_label.setFont(label_font)
-        address_label.setStyleSheet("color: #202124; padding-right: 10px;")
-        self.lineEdit_4 = self.create_input_field()
-        form_layout.addRow(address_label, self.lineEdit_4)
+        fields = [
+            ("Company / College:", "lineEdit"),
+            ("Full Name:", "lineEdit_2"),
+            ("Department / Role:", "lineEdit_dept"),
+            ("Gender:", "lineEdit_3"),
+            ("Address:", "lineEdit_4"),
+            ("Phone Number:", "lineEdit_5"),
+        ]
+        for text, attr in fields:
+            lbl = QLabel(text)
+            lbl.setFont(lbl_font)
+            lbl.setStyleSheet("color: #202124;")
+            inp = QLineEdit()
+            inp.setMinimumHeight(42)
+            inp.setFont(QFont("Segoe UI", 11))
+            inp.setObjectName("inputField")
+            setattr(self, attr, inp)
+            form.addRow(lbl, inp)
 
-        # Phone Number
-        phone_label = QLabel("Phone Number:")
-        phone_label.setFont(label_font)
-        phone_label.setStyleSheet("color: #202124; padding-right: 10px;")
-        self.lineEdit_5 = self.create_input_field()
-        form_layout.addRow(phone_label, self.lineEdit_5)
+        return form
 
-        return form_layout
+    # ── Buttons ─────────────────────────────────────────────
+    def _create_buttons(self):
+        lay = QVBoxLayout()
+        lay.setSpacing(12)
 
-    def create_input_field(self):
-        """Create a styled input field"""
-        input_field = QLineEdit()
-        input_field.setMinimumHeight(40)
-        input_field.setFont(QFont("Segoe UI", 11))
-        input_field.setObjectName("inputField")
-        return input_field
-
-    def create_button_layout(self):
-        """Create button layout"""
-        button_layout = QVBoxLayout()
-        button_layout.setSpacing(12)
-
-        # Capture Image button
-        self.pushButton = QPushButton("Capture Image")
-        self.pushButton.setMinimumHeight(45)
-        self.pushButton.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.pushButton.setObjectName("primaryButton")
-        self.pushButton.clicked.connect(self.capture)
-        button_layout.addWidget(self.pushButton)
-
-        # Generate ID Card button
-        self.pushButton_2 = QPushButton("Generate ID Card")
-        self.pushButton_2.setMinimumHeight(45)
-        self.pushButton_2.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.pushButton_2.setObjectName("primaryButton")
-        self.pushButton_2.clicked.connect(self.generate_idcard)
-        button_layout.addWidget(self.pushButton_2)
-
-        return button_layout
+        self.pushButton = self._btn("Capture Image", self.capture)
+        self.pushButton_2 = self._btn("Generate ID Card", self.generate_idcard)
+        lay.addWidget(self.pushButton)
+        lay.addWidget(self.pushButton_2)
+        return lay
 
     @staticmethod
-    def get_global_stylesheet():
-        """Return global stylesheet for modern SaaS design"""
-        return """
-        QMainWindow {
-            background: qlineargradient(
-                x1: 0, y1: 0, x2: 1, y2: 1,
-                stop: 0 #f0f4ff,
-                stop: 1 #e8f0fe
-            );
-        }
+    def _btn(text, slot):
+        btn = QPushButton(text)
+        btn.setMinimumHeight(48)
+        btn.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        btn.setObjectName("primaryButton")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(slot)
+        return btn
 
-        #cardContainer {
-            background-color: #ffffff;
-            border-radius: 12px;
-            border: none;
-        }
+    # ── Centre on screen ────────────────────────────────────
+    def _center(self):
+        scr = QtWidgets.QApplication.primaryScreen()
+        if scr:
+            sg = scr.geometry()
+            wg = self.geometry()
+            self.move((sg.width() - wg.width()) // 2,
+                      (sg.height() - wg.height()) // 2)
 
-        #inputField {
-            background-color: #f8f9fa;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            padding: 8px 12px;
-            color: #202124;
-            selection-background-color: #1a73e8;
-        }
-
-        #inputField:focus {
-            border: 2px solid #1a73e8;
-            background-color: #ffffff;
-        }
-
-        #inputField::placeholder {
-            color: #9aa0a6;
-        }
-
-        #primaryButton {
-            background-color: #1a73e8;
-            color: #ffffff;
-            border: none;
-            border-radius: 8px;
-            font-weight: bold;
-            padding: 10px 20px;
-        }
-
-        #primaryButton:hover {
-            background-color: #1765cc;
-        }
-
-        #primaryButton:pressed {
-            background-color: #1557b0;
-        }
-
-        QLabel {
-            color: #202124;
-        }
-        """
-
-    def center_window(self):
-        """Center the window on screen"""
-        screen = QtWidgets.QApplication.primaryScreen()
-        if screen:
-            screen_geometry = screen.geometry()
-            window_geometry = self.geometry()
-            x = (screen_geometry.width() - window_geometry.width()) // 2
-            y = (screen_geometry.height() - window_geometry.height()) // 2
-            self.move(x, y)
-
+    # ── Camera capture ──────────────────────────────────────
     def capture(self):
-        """Capture image from camera with improved UI and instructions"""
-        camera = cv2.VideoCapture(0)
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        
-        if not camera.isOpened():
-            QMessageBox.warning(self, "Camera Error", "Unable to open camera. Please check your camera connection.")
+        cam = cv2.VideoCapture(0)
+        cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+        if not cam.isOpened():
+            QMessageBox.warning(self, "Camera Error",
+                                "Unable to open camera. Check your connection.")
             return
-        
-        captured = False
-        
+
         while True:
-            ret, frame = camera.read()
+            ret, frame = cam.read()
             if not ret:
                 break
-            
-            # Flip frame for mirror effect
             frame = cv2.flip(frame, 1)
-            
-            # Add instruction text
-            cv2.putText(frame, "Press C to Capture | Press Q to Quit", (20, 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            # Draw capture area rectangle
-            height, width = frame.shape[:2]
-            start_row, start_col = int(height * 0.25), int(width * 0.25)
-            end_row, end_col = int(height * 0.80), int(width * 0.80)
-            cv2.rectangle(frame, (start_col, start_row), (end_col, end_row), (0, 255, 0), 2)
-            cv2.putText(frame, "Position face within the rectangle", (20, 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            
-            # Display frame
-            cv2.imshow('ID Card Camera - Capture Image', frame)
-            
-            # Capture on 'C' key, Quit on 'Q' key
+
+            h, w = frame.shape[:2]
+            r1, c1 = int(h * 0.15), int(w * 0.30)
+            r2, c2 = int(h * 0.90), int(w * 0.70)
+            cv2.rectangle(frame, (c1, r1), (c2, r2), (0, 255, 0), 2)
+            cv2.putText(frame, "Press C to Capture | Q to Quit",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (0, 255, 0), 2)
+            cv2.putText(frame, "Position face within the rectangle",
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 0), 2)
+            cv2.imshow("ID Card Camera", frame)
+
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('c') or key == ord('C'):
-                try:
-                    cropped_img = frame[start_row:end_row, start_col:end_col]
-                    cv2.imwrite('person.jpg', cropped_img)
-                    captured = True
-                    QMessageBox.information(self, "Success", "Image captured successfully!")
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to save image: {str(e)}")
+            if key in (ord("c"), ord("C")):
+                cv2.imwrite("person.jpg", frame[r1:r2, c1:c2])
+                QMessageBox.information(self, "Done",
+                                        "Image captured successfully!")
                 break
-            elif key == ord('q') or key == ord('Q'):
+            if key in (ord("q"), ord("Q")):
                 break
-        
-        camera.release()
+
+        cam.release()
         cv2.destroyAllWindows()
 
-    def get_font(self, size):
-        """Get font with fallback support"""
-        font_paths = [
-            'arial.ttf',
-            'C:\\Windows\\Fonts\\arial.ttf',
-            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-            '/System/Library/Fonts/Arial.ttf'
-        ]
-        
-        for font_path in font_paths:
-            try:
-                if os.path.exists(font_path):
-                    return ImageFont.truetype(font_path, size=size)
-            except Exception:
-                continue
-        
-        # Fallback to default font
-        return ImageFont.load_default()
-
+    # ── Generate ID Card ────────────────────────────────────
     def generate_idcard(self):
-        """Generate ID card with captured image and error handling"""
+        name = self.lineEdit_2.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Field",
+                                "Please enter Full Name.")
+            return
+        if not os.path.exists("person.jpg"):
+            QMessageBox.warning(self, "Missing Image",
+                                "Please capture an image first.")
+            return
+
+        company = self.lineEdit.text().strip() or "Organization"
+        department = self.lineEdit_dept.text().strip() or "General"
+        gender = self.lineEdit_3.text().strip() or "N/A"
+        address = self.lineEdit_4.text().strip() or "N/A"
+        phone = self.lineEdit_5.text().strip() or "N/A"
+        id_no = str(random.randint(1_000_000, 9_999_999))
+
+        now = datetime.datetime.now()
+        issue_date = now.strftime("%d %b %Y")
+        valid_date = (now + datetime.timedelta(days=365)).strftime("%d %b %Y")
+
+        photo = Image.open("person.jpg")
+
+        front = self._render_front(
+            company, name, id_no, department, gender, phone,
+            photo, issue_date, valid_date,
+        )
+        back = self._render_back(
+            company, name, id_no, department, address, phone,
+            issue_date, valid_date,
+        )
+
         try:
-            # Check if required fields are filled
-            if not self.lineEdit_2.text().strip():
-                QMessageBox.warning(self, "Missing Field", "Please enter Full Name.")
-                return
-            
-            # Check if person.jpg exists
-            if not os.path.exists('person.jpg'):
-                QMessageBox.warning(self, "Missing Image", "Please capture an image first using 'Capture Image' button.")
-                return
-            
-            # Load captured person image
-            person_image = Image.open('person.jpg')
-            
-            # Generating Blank White Image
-            image = Image.new('RGB', (1000, 900), (255, 255, 255))
-            draw = ImageDraw.Draw(image)
-            
-            # Get fonts with fallback
-            font_80 = self.get_font(80)
-            font_60 = self.get_font(60)
-            font_45 = self.get_font(45)
-            
-            date = datetime.datetime.now()
-            
-            # Company Name
-            (x, y) = (50, 50)
-            message = self.lineEdit.text() or "Company"
-            company = message
-            color = 'rgb(0, 0, 0)'
-            draw.text((x, y), message, fill=color, font=font_80)
-            
-            # ID Number
-            (x, y) = (50, 350)
-            id_no = random.randint(1000000, 9000000)
-            message = f'ID {id_no}'
-            color = 'rgb(255, 0, 0)'
-            draw.text((x, y), message, fill=color, font=font_60)
-            
-            # Full Name
-            (x, y) = (50, 250)
-            message = self.lineEdit_2.text()
-            name = message
-            color = 'rgb(0, 0, 0)'
-            draw.text((x, y), message, fill=color, font=font_45)
-            
-            # Gender
-            (x, y) = (50, 550)
-            message = self.lineEdit_3.text() or "N/A"
-            color = 'rgb(0, 0, 0)'
-            draw.text((x, y), message, fill=color, font=font_45)
-            
-            # Phone Number
-            (x, y) = (50, 650)
-            message = self.lineEdit_5.text() or "N/A"
-            color = 'rgb(0, 0, 0)'
-            draw.text((x, y), message, fill=color, font=font_45)
-            
-            # Address
-            (x, y) = (50, 750)
-            message = self.lineEdit_4.text() or "N/A"
-            color = 'rgb(0, 0, 0)'
-            draw.text((x, y), message, fill=color, font=font_45)
-            
-            # Paste person image directly onto the card
-            image.paste(person_image, (600, 75))
-            
-            # Save final ID card with clean filename
-            output_filename = f"{name}_IDCard.png"
-            image.save(output_filename)
-            
-            # Delete temporary person.jpg file
-            if os.path.exists('person.jpg'):
-                os.remove('person.jpg')
-            
-            # Show success message
-            QMessageBox.information(self, "Success", f"ID Card generated successfully!\n\nSaved as: {output_filename}")
-            
-        except FileNotFoundError as e:
-            QMessageBox.critical(self, "File Error", f"File not found: {str(e)}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to generate ID card: {str(e)}")
+            os.remove("person.jpg")
+        except OSError:
+            pass
+
+        dlg = IDCardPreview(front, back, name, parent=self)
+        dlg.exec_()
+
+    # ═══════════════════════════════════════════════════════
+    #  FRONT CARD
+    # ═══════════════════════════════════════════════════════
+    def _render_front(self, company, name, id_no, dept, gender,
+                      phone, photo, issue_date, valid_date):
+        card = Image.new("RGB", (CARD_W, CARD_H), C_WHITE)
+        d = ImageDraw.Draw(card)
+
+        # ── Header bar ──
+        d.rectangle([(0, 0), (CARD_W, HEADER_H)], fill=C_PRIMARY)
+        d.rectangle([(0, HEADER_H), (CARD_W, HEADER_H + ACCENT_H)],
+                    fill=C_ACCENT)
+
+        # Monogram logo
+        mono = monogram_circle(
+            company[0].upper(), 70, C_WHITE, C_PRIMARY,
+            get_font(36, bold=True),
+        )
+        card.paste(mono, (40, 25), mono)
+
+        # Company name + subtitle
+        d.text((125, 30), company,
+               fill=C_WHITE, font=get_font(32, bold=True))
+        d.text((125, 72), "IDENTITY CARD",
+               fill=C_HEADER_SUB, font=get_font(16))
+
+        # ── Photo with border ──
+        body_top = HEADER_H + ACCENT_H
+        px, py = 55, body_top + 25
+        inner_w = PHOTO_W - 2 * PHOTO_BORDER
+        inner_h = PHOTO_H - 2 * PHOTO_BORDER
+        ph = photo.resize((inner_w, inner_h), Image.LANCZOS)
+
+        d.rectangle(
+            [(px - PHOTO_BORDER, py - PHOTO_BORDER),
+             (px + inner_w + PHOTO_BORDER, py + inner_h + PHOTO_BORDER)],
+            fill=C_PRIMARY,
+        )
+        card.paste(ph, (px, py))
+
+        # ── Vertical accent divider ──
+        divider_x = 275
+        d.line([(divider_x, body_top + 25),
+                (divider_x, CARD_H - FOOTER_H - 10)],
+               fill=C_ACCENT, width=2)
+
+        # ── Info fields ──
+        ix = 300
+        iy = body_top + 30
+        label_font = get_font(15)
+        value_font = get_font(22, bold=True)
+        name_font = get_font(28, bold=True)
+        gap = 58
+
+        # Name
+        d.text((ix, iy), "NAME", fill=C_GRAY, font=label_font)
+        d.text((ix, iy + 20), name, fill=C_DARK, font=name_font)
+        iy += gap + 14
+
+        # ID number (red accent)
+        d.text((ix, iy), "ID NUMBER", fill=C_GRAY, font=label_font)
+        d.text((ix, iy + 20), id_no, fill=C_RED, font=value_font)
+        iy += gap
+
+        # Department
+        d.text((ix, iy), "DEPARTMENT", fill=C_GRAY, font=label_font)
+        d.text((ix, iy + 20), dept, fill=C_DARK, font=value_font)
+        iy += gap
+
+        # Gender
+        d.text((ix, iy), "GENDER", fill=C_GRAY, font=label_font)
+        d.text((ix, iy + 20), gender, fill=C_DARK, font=value_font)
+        iy += gap
+
+        # Phone
+        d.text((ix, iy), "PHONE", fill=C_GRAY, font=label_font)
+        d.text((ix, iy + 20), phone, fill=C_DARK, font=value_font)
+
+        # ── Footer ──
+        fy = CARD_H - FOOTER_H
+        d.rectangle([(0, fy), (CARD_W, CARD_H)], fill=C_LIGHT_GRAY)
+        d.line([(0, fy), (CARD_W, fy)], fill=(224, 224, 224), width=1)
+
+        foot = get_font(16)
+        foot_b = get_font(16, bold=True)
+        d.text((55, fy + 18), "Issue Date:", fill=C_GRAY, font=foot)
+        d.text((170, fy + 18), issue_date, fill=C_DARK, font=foot_b)
+        d.text((55, fy + 46), "Valid Until:", fill=C_GRAY, font=foot)
+        d.text((170, fy + 46), valid_date, fill=C_DARK, font=foot_b)
+
+        # Bottom accent bar
+        d.rectangle([(0, CARD_H - 6), (CARD_W, CARD_H)], fill=C_PRIMARY)
+
+        return round_corners(card, CORNER_R)
+
+    # ═══════════════════════════════════════════════════════
+    #  BACK CARD
+    # ═══════════════════════════════════════════════════════
+    def _render_back(self, company, name, id_no, dept, address,
+                     phone, issue_date, valid_date):
+        card = Image.new("RGB", (CARD_W, CARD_H), C_WHITE)
+        d = ImageDraw.Draw(card)
+
+        # ── Header ──
+        d.rectangle([(0, 0), (CARD_W, 80)], fill=C_PRIMARY)
+        d.rectangle([(0, 80), (CARD_W, 84)], fill=C_ACCENT)
+
+        comp_font = get_font(28, bold=True)
+        tw = d.textlength(company, font=comp_font)
+        d.text(((CARD_W - tw) / 2, 24), company,
+               fill=C_WHITE, font=comp_font)
+
+        # ── Info section ──
+        y = 110
+        lf = get_font(15)
+        vf = get_font(20)
+
+        d.text((55, y), "ADDRESS", fill=C_GRAY, font=lf)
+        d.text((55, y + 24), address, fill=C_DARK, font=vf)
+        y += 75
+
+        d.text((55, y), "PHONE", fill=C_GRAY, font=lf)
+        d.text((55, y + 24), phone, fill=C_DARK, font=vf)
+        y += 75
+
+        d.text((55, y), "DEPARTMENT", fill=C_GRAY, font=lf)
+        d.text((55, y + 24), dept, fill=C_DARK, font=vf)
+
+        # ── QR code ──
+        qr_data = f"Name: {name}\nID: {id_no}\nDept: {dept}\nPhone: {phone}"
+        qr_img = qrcode.make(
+            qr_data, box_size=5, border=2
+        ).resize((180, 180)).convert("RGB")
+        card.paste(qr_img, (CARD_W - 235, 110))
+
+        # ── Divider ──
+        y = 380
+        d.line([(55, y), (CARD_W - 55, y)], fill=(224, 224, 224), width=1)
+
+        # ── Terms ──
+        y += 15
+        tf = get_font(13)
+        d.text((55, y),
+               "This card is the property of the issuing organization.",
+               fill=C_GRAY, font=tf)
+        d.text((55, y + 22),
+               "If found, please return to the address above.",
+               fill=C_GRAY, font=tf)
+
+        # ── Signature line ──
+        y += 65
+        d.text((55, y), "Authorized Signature", fill=C_GRAY,
+               font=get_font(14))
+        d.line([(55, y + 24), (300, y + 24)], fill=C_DARK, width=1)
+
+        # ── Footer ──
+        fy = CARD_H - FOOTER_H
+        d.rectangle([(0, fy), (CARD_W, CARD_H)], fill=C_LIGHT_GRAY)
+        d.line([(0, fy), (CARD_W, fy)], fill=(224, 224, 224))
+
+        note = ("This card is non-transferable and must be "
+                "returned upon request.")
+        nw = d.textlength(note, font=get_font(13))
+        d.text(((CARD_W - nw) / 2, fy + 20), note,
+               fill=C_GRAY, font=get_font(13))
+
+        validity = f"Valid: {issue_date}  \u2014  {valid_date}"
+        vw = d.textlength(validity, font=get_font(14, bold=True))
+        d.text(((CARD_W - vw) / 2, fy + 48), validity,
+               fill=C_DARK, font=get_font(14, bold=True))
+
+        # Bottom accent bar
+        d.rectangle([(0, CARD_H - 6), (CARD_W, CARD_H)], fill=C_PRIMARY)
+
+        return round_corners(card, CORNER_R)
 
 
+# ─── Global stylesheet ────────────────────────────────────
+_MAIN_STYLE = """
+QMainWindow {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #f0f4ff, stop:1 #e8f0fe);
+}
+#appTitle {
+    color: #0D47A1;
+    font-size: 28px;
+    font-weight: bold;
+    font-family: 'Segoe UI';
+}
+#cardContainer {
+    background: #ffffff;
+    border-radius: 14px;
+}
+#inputField {
+    background: #f8f9fa;
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 8px 14px;
+    color: #202124;
+    selection-background-color: #1a73e8;
+}
+#inputField:focus {
+    border: 2px solid #1a73e8;
+    background: #ffffff;
+}
+#primaryButton {
+    background-color: #0D47A1;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+}
+#primaryButton:hover {
+    background-color: #1565C0;
+}
+#primaryButton:pressed {
+    background-color: #0D47A1;
+}
+QLabel {
+    color: #202124;
+}
+"""
+
+
+# ─── Entry Point ──────────────────────────────────────────
 def main():
-    """Main entry point for the application"""
     app = QtWidgets.QApplication(sys.argv)
     window = IDCardGenerator()
     window.show()

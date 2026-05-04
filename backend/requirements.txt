@@ -1,0 +1,6 @@
+flask
+flask-cors
+Pillow
+qrcode
+opencv-python
+PyQt5

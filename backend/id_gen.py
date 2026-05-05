@@ -1,12 +1,26 @@
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
-from PyQt5.QtGui import QFont, QPixmap, QImage
-from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLineEdit, QPushButton, QLabel, QSpacerItem, QSizePolicy,
-    QMessageBox, QDialog, QFileDialog, QGraphicsDropShadowEffect,
-    QGraphicsOpacityEffect,
-)
+try:
+    from PyQt5 import QtCore, QtGui, QtWidgets
+    from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
+    from PyQt5.QtGui import QFont, QPixmap, QImage
+    from PyQt5.QtWidgets import (
+        QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+        QLineEdit, QPushButton, QLabel, QSpacerItem, QSizePolicy,
+        QMessageBox, QDialog, QFileDialog, QGraphicsDropShadowEffect,
+        QGraphicsOpacityEffect,
+    )
+    HAS_GUI = True
+except ImportError:
+    HAS_GUI = False
+    # Define dummy classes to prevent import errors in headless mode
+    class QMainWindow: pass
+    class QDialog: pass
+    class Qt:
+        AlignCenter = None
+        KeepAspectRatio = None
+        SmoothTransformation = None
+        PointingHandCursor = None
+        Bold = None
+
 from PIL import Image, ImageDraw, ImageFont
 import random
 import os

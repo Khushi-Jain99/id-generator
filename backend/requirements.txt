@@ -2,5 +2,6 @@ flask
 flask-cors
 Pillow
 qrcode
-opencv-python
-PyQt5
+opencv-python-headless
+gunicorn
+python-dotenv

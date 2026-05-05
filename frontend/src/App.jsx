@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Camera, RefreshCcw, Download, CheckCircle, AlertCircle, Loader2, CreditCard } from 'lucide-react';
 import './App.css';
 
-const API_URL = 'http://localhost:5000/generate';
+const API_URL = 'https://id-generator-system.onrender.com/generate';
 
 function App() {
   const [formData, setFormData] = useState({
